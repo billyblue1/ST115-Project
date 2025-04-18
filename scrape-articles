@@ -1,0 +1,256 @@
+import os
+import csv
+import re
+import time
+import pandas as pd
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# years to keep
+YEARS = {"2022", "2023", "2024", "2025"}
+
+
+def normalize_date(text):
+    """
+    Remove ordinal suffixes (st, nd, rd, th) and parse into a date object.
+    """
+    text = text.title()
+    txt = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', text, flags=re.IGNORECASE)
+    for fmt in ["%B %d, %Y", "%d %B, %Y", "%B %Y"]:
+        try:
+            return datetime.strptime(txt, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def scrape_article_details(driver, wait, url):
+    """
+    Given an article URL (driver already navigated), extract author, reading time, shares, comments, and full content.
+    """
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.main-container')))
+
+    author_selectors = [
+        '.single-post__main-sidebar h3',          
+        '.mobile-post-main-image__date h3',       
+        '.byline',                                
+        '.author-info',                           
+        '.post-author',                           
+        '.author a',                            
+        '.post-meta .author',                    
+        '.article-meta .author'                
+    ]
+    
+    author = ''
+    for selector in author_selectors:
+        try:
+            author_elem = driver.find_element(By.CSS_SELECTOR, selector)
+            author = author_elem.text.strip()
+            if author and len(author) > 1:  
+                break
+        except Exception:
+            continue
+    
+    if not author:
+        try:
+            paragraphs = driver.find_elements(By.CSS_SELECTOR, '.post-content p')
+            if paragraphs:
+                first_p = paragraphs[0].text.strip()
+                if first_p.startswith("By ") and len(first_p) < 100:
+                    author = first_p.replace("By ", "").strip()
+        except Exception:
+            pass
+
+    try:
+        rt_elem = driver.find_element(By.CSS_SELECTOR, 'p.reading-time')
+        reading_time = rt_elem.text.replace('Estimated reading time: ', '').strip()
+    except Exception:
+        reading_time = ''
+
+    try:
+        comments = driver.find_element(By.CSS_SELECTOR, '.post-main-image__meta a[href="#comments"]').text.split()[0]
+    except Exception:
+        comments = ''
+
+    try:
+        meta_text = driver.find_element(By.CSS_SELECTOR, '.post-main-image__meta').text
+        parts = meta_text.split('|')
+        shares = parts[-1].strip().split()[0] if len(parts) > 1 else ''
+    except Exception:
+        shares = ''
+
+    paragraphs = []
+    for p in driver.find_elements(By.CSS_SELECTOR, '.post-content p'):
+        text = p.text.strip()
+        if text:
+            paragraphs.append(text)
+    content = "\n\n".join(paragraphs)
+
+    return author, reading_time, shares, comments, content
+
+
+def main():
+    infile = os.path.join('data', 'articles.csv')
+    out_rows = []
+    
+    update_existing = os.path.exists(infile)
+    existing_df = None
+    
+    if update_existing:
+        print("Found existing articles.csv - checking for articles with content but missing author information...")
+        existing_df = pd.read_csv(infile, dtype=str)
+        
+        has_content = existing_df['content'].notna() & (existing_df['content'] != '')
+        missing_author = existing_df['author'].isna() | (existing_df['author'] == '')
+        to_update = has_content & missing_author
+        
+        print(f"Found {to_update.sum()} articles with content but missing author information.")
+        
+        if to_update.sum() > 0:
+            opts = Options()
+            opts.add_argument("--headless")
+            opts.add_argument("--disable-gpu")
+            driver = webdriver.Chrome(options=opts)
+            wait = WebDriverWait(driver, 10)
+            
+            articles_scraped = 0
+            articles_with_author = 0
+            
+            try:
+                for idx in existing_df[to_update].index:
+                    url = existing_df.loc[idx, 'article_url']
+                    print(f"Fetching author for {url}")
+                    
+                    try:
+                        driver.get(url)
+                        
+                        author = ''
+                        for selector in ['.single-post__main-sidebar h3', '.mobile-post-main-image__date h3', '.byline', '.author-info', '.post-author']:
+                            try:
+                                author_elem = driver.find_element(By.CSS_SELECTOR, selector)
+                                author = author_elem.text.strip()
+                                if author:
+                                    break
+                            except:
+                                continue
+                        
+                        if author:
+                            existing_df.loc[idx, 'author'] = author
+                            articles_with_author += 1
+                            print(f"  ✅ Found author: '{author}'")
+                        else:
+                            print(f"  ❌ Could not find author")
+                        
+                        articles_scraped += 1
+                        
+                        if articles_scraped % 10 == 0:
+                            existing_df.to_csv(infile, index=False)
+                            print(f"Progress: {articles_scraped}/{to_update.sum()} articles processed, {articles_with_author} authors found")
+                    
+                    except Exception as e:
+                        print(f"  ❌ Error: {e}")
+                        continue
+                
+            finally:
+                driver.quit()
+                existing_df.to_csv(infile, index=False)
+                print(f"Author update complete. Updated {articles_with_author} out of {articles_scraped} attempted articles.")
+            
+            return
+    
+    print("Starting full article scrape...")
+    
+    opts = Options()
+    opts.add_argument("--headless")
+    opts.add_argument("--disable-gpu")
+    driver = webdriver.Chrome(options=opts)
+    wait = WebDriverWait(driver, 10)
+
+    with open("data/blogs.csv", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            blog_name = row["name"]
+            blog_url = row["url"]
+            print(f"Scraping all posts for '{blog_name}'…")
+
+            driver.get(blog_url)
+            try:
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.index-all-posts div.cta-card")))
+            except Exception:
+                print(f"  ⚠️  No posts found at {blog_url}")
+                continue
+
+            last_height = driver.execute_script("return document.body.scrollHeight")
+            while True:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    break
+                last_height = new_height
+
+            cards = driver.find_elements(By.CSS_SELECTOR, "div.index-all-posts div.cta-card a")
+            found = skipped = 0
+            for a in cards:
+                try:
+                    date_txt = a.find_element(By.TAG_NAME, "h4").text.strip()
+                    date_obj = normalize_date(date_txt)
+                    if date_obj is None:
+                        skipped += 1
+                        continue
+                except Exception:
+                    skipped += 1
+                    continue
+
+                if str(date_obj.year) not in YEARS:
+                    skipped += 1
+                    continue
+
+                title = a.find_element(By.TAG_NAME, "h3").text.strip()
+                url = a.get_attribute("href")
+
+                driver.get(url)
+                try:
+                    author, reading_time, shares, comments, content = scrape_article_details(driver, wait, url)
+                except Exception as e:
+                    print(f"Error scraping details for {url}: {e}")
+                    author = reading_time = shares = comments = content = ''
+
+                out_rows.append({
+                    "blog_name":     blog_name,
+                    "blog_url":      blog_url,
+                    "article_title": title,
+                    "article_url":   url,
+                    "article_date":  date_obj.isoformat(),
+                    "author":        author,
+                    "reading_time":  reading_time,
+                    "shares":        shares,
+                    "comments":      comments,
+                    "content":       content
+                })
+                found += 1
+
+            print(f"  Found {found} articles, skipped {skipped}")
+
+    driver.quit()
+
+    os.makedirs("data", exist_ok=True)
+    out_path = os.path.join("data", "articles.csv")
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "blog_name", "blog_url", "article_title", "article_url",
+            "article_date", "author", "reading_time", "shares", "comments", "content"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(out_rows)
+
+    print(f"\nDone — scraped {len(out_rows)} articles (2022–2025) into '{out_path}'")
+
+
+if __name__ == "__main__":
+    main()
